@@ -9,31 +9,35 @@ const rateLimit = require("express-rate-limit");
 let chatHistory = [];
 const app = express();
 app.use(cors());
+app.set('trust proxy', 1); // Fix ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
 app.use(express.json());
 
 // Rate limiting middleware
 const uploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // Limit each IP to 5 upload requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 5,
   message: "Too many PDF uploads from this IP, please try again after 15 minutes",
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
 });
 
 const askLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 30, // Limit each IP to 30 questions per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 30,
   message: "Too many questions asked, please try again after 15 minutes",
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
 });
 
 const summarizeLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // Limit each IP to 10 summarizations per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 10,
   message: "Too many summarization requests, please try again after 15 minutes",
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
 });
 
 // Storage for uploaded PDFs
@@ -62,7 +66,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 });
 
 // Route: Ask Question
-app.post("/ask", async (req, res) => {
+app.post("/ask", askLimiter, async (req, res) => {
   try {
     const question = req.body.question;
 
