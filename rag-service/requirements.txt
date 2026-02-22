@@ -12,3 +12,16 @@ pypdf
 requests
 numpy
 slowapi
+
+# Authentication dependencies
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+sqlalchemy
+alembic
+
+# Testing dependencies
+pytest
+pytest-asyncio
+httpx
+pytest-mock

@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Request, File, UploadFile
+from fastapi import FastAPI, Request, File, UploadFile, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,9 +17,48 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+# Authentication imports
+from database import engine, get_db
+from auth.models import Base, User
+from auth.router import router as auth_router
+from auth.middleware import (
+    get_current_user, 
+    get_optional_user,
+    require_upload_permission,
+    require_ask_permission,
+    require_summarize_permission,
+    require_compare_permission,
+    require_view_documents_permission
+)
+
 load_dotenv()
 
-app = FastAPI()
+# ===============================
+# APP INITIALIZATION 
+# ===============================
+app = FastAPI(
+    title="PDF QA Bot API",
+    description="Secure PDF Question-Answering Bot with Authentication",
+    version="2.0.0"
+)
+
+# CORS middleware for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ===============================
+# DATABASE INITIALIZATION
+# ===============================
+# Create database tables
+Base.metadata.create_all(bind=engine)
+
+# Include authentication router
+app.include_router(auth_router)
 
 # ===============================
 # RATE LIMITING SETUP 
@@ -121,8 +161,12 @@ class CompareRequest(BaseModel):
 # ===============================
 @app.post("/upload") 
 @limiter.limit("10/15 minutes")
-async def upload_file(request: Request, file: UploadFile = File(...)):
-    """Upload and process PDF file"""
+async def upload_file(
+    request: Request, 
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_upload_permission)
+):
+    """Upload and process PDF file (Authentication required)"""
     if not file.filename.lower().endswith('.pdf'):
         return {"error": "Only PDF files are supported"}
     
@@ -139,8 +183,45 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         # Process the PDF
         result = process_pdf_internal(file_path)
         
+        # Add user info to the result for audit trail
+        if result and "doc_id" in result:
+            result["uploaded_by"] = current_user.username
+            result["user_id"] = current_user.id
+        
         # Clean up temporary file (optional - you may want to keep it)
         # os.remove(file_path)
+        
+        return result
+        
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
+
+# Optional: Legacy endpoint for backward compatibility (will be deprecated)
+@app.post("/upload/anonymous", deprecated=True) 
+@limiter.limit("5/15 minutes")  # More restrictive rate limit for anonymous users
+async def upload_file_anonymous(
+    request: Request, 
+    file: UploadFile = File(...)
+):
+    """Upload and process PDF file (Anonymous - Deprecated)"""
+    import warnings
+    warnings.warn("Anonymous upload is deprecated. Please use authenticated endpoint.", DeprecationWarning)
+    
+    if not file.filename.lower().endswith('.pdf'):
+        return {"error": "Only PDF files are supported"}
+    
+    # Save uploaded file temporarily
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)  
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+    
+    try:
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Process the PDF
+        result = process_pdf_internal(file_path)
         
         return result
         
@@ -203,24 +284,40 @@ def process_pdf_internal(file_path: str):
 # ===============================
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
-def process_pdf(request: Request, data: PDFPath):
-    """Process PDF from file path"""
-    return process_pdf_internal(data.filePath)
+def process_pdf(
+    request: Request, 
+    data: PDFPath,
+    current_user: User = Depends(require_upload_permission)
+):
+    """Process PDF from file path (Authentication required)"""
+    result = process_pdf_internal(data.filePath)
+    
+    # Add user info to the result for audit trail
+    if result and "doc_id" in result:
+        result["processed_by"] = current_user.username
+        result["user_id"] = current_user.id
+    
+    return result
 
 
 # ===============================
 # LIST DOCUMENTS
 # ===============================
 @app.get("/documents")
-def list_documents():
-    return DOCUMENT_REGISTRY
+def list_documents(current_user: User = Depends(require_view_documents_permission)):
+    """List all processed documents (Authentication required)"""
+    return {
+        "documents": DOCUMENT_REGISTRY,
+        "requested_by": current_user.username
+    }
 
 
 # ===============================
 # SIMILARITY MATRIX
 # ===============================
 @app.get("/similarity-matrix")
-def similarity_matrix():
+def similarity_matrix(current_user: User = Depends(require_view_documents_permission)):
+    """Get similarity matrix between documents (Authentication required)"""
     if len(DOCUMENT_EMBEDDINGS) < 2:
         return {"error": "At least 2 documents required."}
 
@@ -234,7 +331,10 @@ def similarity_matrix():
         for j, other_id in enumerate(doc_ids):
             result[doc_id][other_id] = float(sim_matrix[i][j])
 
-    return result
+    return {
+        "similarity_matrix": result,
+        "requested_by": current_user.username
+    }
 
 
 # ===============================
@@ -242,7 +342,11 @@ def similarity_matrix():
 # ===============================
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(request: Request, data: Question):
+def ask_question(
+    request: Request, 
+    data: Question,
+    current_user: User = Depends(require_ask_permission)
+):
     global VECTOR_STORE
 
     if VECTOR_STORE is None:
@@ -287,7 +391,11 @@ def ask_question(request: Request, data: Question):
 # ===============================
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, data: SummarizeRequest):
+def summarize_pdf(
+    request: Request, 
+    data: SummarizeRequest,
+    current_user: User = Depends(require_summarize_permission)
+):
     global VECTOR_STORE
 
     if VECTOR_STORE is None:
@@ -317,7 +425,11 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 # NEW: COMPARE SELECTED DOCUMENTS
 # ===============================
 @app.post("/compare")
-def compare_documents(data: CompareRequest):
+def compare_documents(
+    data: CompareRequest,
+    current_user: User = Depends(require_compare_permission)
+):
+    """Compare selected documents (Authentication required)"""
     global VECTOR_STORE, DOCUMENT_REGISTRY
 
     if VECTOR_STORE is None:
