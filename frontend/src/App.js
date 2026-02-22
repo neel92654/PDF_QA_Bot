@@ -84,10 +84,10 @@ function App() {
       const blob = new Blob([csv], { type: "text/csv" });
       saveAs(blob, `${selectedPdf}-chat.csv`);
     } else if (type === "pdf") {
-      // Simple text PDF export
+      // Export chat as plain text (real PDF would require jsPDF/pdf-lib)
       const text = chat.map(msg => `${msg.role}: ${msg.text}`).join("\n\n");
-      const blob = new Blob([text], { type: "application/pdf" });
-      saveAs(blob, `${selectedPdf}-chat.pdf`);
+      const blob = new Blob([text], { type: "text/plain" });
+      saveAs(blob, `${selectedPdf}-chat.txt`);
     }
   };
 
@@ -201,7 +201,7 @@ function App() {
                   {summarizing ? <Spinner animation="border" size="sm" /> : "Summarize PDF"}
                 </Button>
                 <Button variant="outline-secondary" className="me-2" onClick={() => exportChat("csv")} disabled={!selectedPdf}>Export CSV</Button>
-                <Button variant="outline-secondary" onClick={() => exportChat("pdf")} disabled={!selectedPdf}>Export PDF</Button>
+                <Button variant="outline-secondary" onClick={() => exportChat("pdf")} disabled={!selectedPdf}>Export TXT</Button>
               </Card.Body>
             </Card>
           </Col>

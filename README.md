@@ -6,7 +6,7 @@ RAG-based PDF question-answering app with:
 - **Backend API**: Node + Express (`server.js`)
 - **RAG Service**: FastAPI + Hugging Face + FAISS (`rag-service/`)
 
-Upload a PDF, ask questions from its content, and generate a short summary.
+Upload a PDF, ask questions from its content, and generate a short summary. You can export the chat as **CSV** or **TXT** (plain text).
 
 ## Architecture
 
