@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -11,8 +11,12 @@ import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from pathlib import Path
 
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
 
 app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
@@ -88,10 +92,20 @@ class SummarizeRequest(BaseModel):
 
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
-def process_pdf(data: PDFPath):
+def process_pdf(request: Request, data: PDFPath):
     global vectorstore, qa_chain
+    
+    # Resolve the absolute path of the uploaded file
+    file_path = Path(data.filePath).resolve()
+    
+    # Block LFI / Path Traversal
+    if not str(file_path).startswith(str(UPLOAD_DIR)):
+        return {"error": "Invalid file path"}
 
-    loader = PyPDFLoader(data.filePath)
+    if not file_path.exists():
+        return {"error": "File not found"}
+
+    loader = PyPDFLoader(str(file_path))
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
@@ -99,15 +113,20 @@ def process_pdf(data: PDFPath):
     if not chunks:
             return {"error": "No text chunks generated from the PDF. Please check your file."}
     vectorstore = FAISS.from_documents(chunks, embedding_model)
-
     qa_chain = True  # Just a flag to indicate PDF is processed
+    
+    # Clear the file after processing for security
+    try:
+        os.remove(file_path)
+    except Exception as e:
+        print(f"Warning: Failed to delete file {file_path}: {e}")
 
     return {"message": "PDF processed successfully"}
 
 
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(data: Question):
+def ask_question(request: Request, data: Question):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"answer": "Please upload a PDF first!"}
@@ -132,7 +151,7 @@ def ask_question(data: Question):
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(_: SummarizeRequest):
+def summarize_pdf(request: Request, data: SummarizeRequest):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"summary": "Please upload a PDF first!"}

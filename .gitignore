@@ -32,3 +32,6 @@ __pycache__/
 venv/
 
 .env
+
+# Ignore the uploads directory where PDFs are stored temporarily
+/uploads/

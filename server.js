@@ -5,8 +5,11 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
+const { fileTypeFromFile } = require("file-type");
 
 const app = express();
+app.set("trust proxy", 1); // Trust first proxy for rate limiting if behind a proxy
 app.use(cors());
 app.use(express.json());
 
@@ -36,7 +39,26 @@ const summarizeLimiter = rateLimit({
 });
 
 // Storage for uploaded PDFs
-const upload = multer({ dest: "uploads/" });
+const UPLOAD_DIR = path.resolve(__dirname, "uploads");
+
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR);
+}
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      cb(null, UPLOAD_DIR);
+    },
+    filename: (req, file, cb) => {
+      const safeName = crypto.randomUUID();
+      cb(null, `${safeName}.pdf`);
+    },
+  }),
+  limits: {
+    fileSize: 20 * 1024 * 1024, // 20MB
+  },
+}); 
 
 // Route: Upload PDF
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
@@ -45,7 +67,27 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
     }
 
-    const filePath = path.join(__dirname, req.file.path);
+    const filePath = path.resolve(req.file.path);
+
+    //Magic byte check to ensure it's a PDF
+    const fileType = await fileTypeFromFile(filePath);
+    if (!fileType || fileType.mime !== "application/pdf") {
+      fs.unlinkSync(filePath); // Delete the invalid file
+      return res.status(400).json({ error: "Invalid PDF file uploaded." });
+    }
+
+    //Ensure file is not empty
+    const stats = fs.statSync(filePath);
+    if (stats.size === 0) {
+      fs.unlinkSync(filePath); // Delete the empty file
+      return res.status(400).json({ error: "Uploaded PDF is empty." });
+    }
+
+    //Ensure file stays in uploads directory and is not executable
+    if (!filePath.startsWith(UPLOAD_DIR) || path.extname(filePath) !== ".pdf") {
+      fs.unlinkSync(filePath); // Delete the suspicious file
+      return res.status(400).json({ error: "Invalid file path or type." });
+    }
 
     // Send PDF to Python service
     await axios.post("http://localhost:5000/process-pdf", {
@@ -84,6 +126,16 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
     console.error("Summarization failed:", details);
     res.status(500).json({ error: "Error summarizing PDF", details });
   }
+});
+
+// Global error handler for multer file size limit
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({ error: "File exceeds 20MB limit." });
+    }
+  }
+  next(err);
 });
 
 app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
