@@ -33,6 +33,5 @@ venv/
 
 .env
 
-# Uploaded PDFs
 uploads/*
 !uploads/.gitkeep
