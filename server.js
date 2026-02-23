@@ -62,7 +62,7 @@ axiosRetry(axios, {
 });
 
 // ------------------------------------------------------------------
-// RATE LIMITERS (MASTER FEATURE)
+// RATE LIMITERS
 // ------------------------------------------------------------------
 const uploadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -138,15 +138,14 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       });
     }
 
-    const sessionId = req.body.sessionId;
+    const { sessionId } = req.body;
     if (!sessionId) {
       return res.status(400).json({ error: "Missing sessionId." });
     }
 
     const filePath = path.join(__dirname, req.file.path);
 
-    // Send document to Python service with session isolation
-    const response = await axios.post(
+    await axios.post(
       "http://localhost:5000/process-pdf",
       { filePath, session_id: sessionId },
       { timeout: API_REQUEST_TIMEOUT }
@@ -174,7 +173,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 app.post("/ask", askLimiter, async (req, res) => {
   const { question, sessionId } = req.body;
 
-  // ---- Input validation (PR FEATURE) ----
+  // ---- Input validation ----
   if (!sessionId) {
     return res.status(400).json({ error: "Missing sessionId." });
   }

@@ -212,11 +212,11 @@ def generate_with_timeout(model, encoded, max_new_tokens, pad_token_id, timeout)
         except Exception as e:
             result["error"] = str(e)
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout)
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
 
-    if t.is_alive():
+    if thread.is_alive():
         raise TimeoutException("LLM generation timed out")
 
     if result["error"]:

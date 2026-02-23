@@ -10,6 +10,8 @@ import {
   Card,
   Spinner,
   Navbar,
+  Row,
+  Col,
 } from "react-bootstrap";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -32,15 +34,12 @@ function App() {
   const [comparisonResult, setComparisonResult] = useState(null);
 
   // -------------------------------
-  // UI / status state
+  // UI state
   // -------------------------------
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [comparing, setComparing] = useState(false);
-
-  const [numPages, setNumPages] = useState(null);
-  const [pageNumber, setPageNumber] = useState(1);
 
   // -------------------------------
   // Theme persistence
@@ -51,7 +50,7 @@ function App() {
   });
 
   // -------------------------------
-  // Session isolation (security fix)
+  // Session isolation
   // -------------------------------
   const [sessionId, setSessionId] = useState("");
 
@@ -68,38 +67,43 @@ function App() {
     document.body.classList.toggle("dark-mode", darkMode);
   }, [darkMode]);
 
-  // ===============================
-  // Upload
-  // ===============================
-  const uploadDocument = async () => {
+  // -------------------------------
+  // Upload PDF (with timeout)
+  // -------------------------------
+  const uploadPDF = async () => {
     if (!file) return;
 
     setUploading(true);
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("sessionId", sessionId);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90_000);
 
     try {
-      const res = await axios.post(`${API_BASE}/upload`, formData);
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("sessionId", sessionId);
+
+      const res = await axios.post(`${API_BASE}/upload`, formData, {
+        signal: controller.signal,
+      });
+
       const url = URL.createObjectURL(file);
-      const dotIndex = file.name.lastIndexOf(".");
-      const ext =
-        dotIndex !== -1 && dotIndex < file.name.length - 1
-          ? file.name.substring(dotIndex + 1).toLowerCase()
-          : "";
       setPdfs((prev) => [
         ...prev,
         { name: file.name, doc_id: res.data?.doc_id, url, ext },
       ]);
 
       setFile(null);
-      alert("Document uploaded!");
-    } catch {
-      alert("Upload failed.");
+      alert("PDF uploaded!");
+    } catch (e) {
+      if (e.name === "AbortError" || e.code === "ECONNABORTED") {
+        alert("Upload timed out. Try a smaller PDF.");
+      } else {
+        alert("Upload failed.");
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      setUploading(false);
     }
-
-    setUploading(false);
   };
 
   // -------------------------------
@@ -115,34 +119,47 @@ function App() {
   };
 
   // -------------------------------
-  // Ask question
+  // Ask question (with timeout)
   // -------------------------------
   const askQuestion = async () => {
     if (!question.trim() || selectedDocs.length === 0) return;
+    if (question.length > 2000) {
+      alert("Question too long (max 2000 characters)");
+      return;
+    }
 
+    setAsking(true);
     setChatHistory((prev) => [...prev, { role: "user", text: question }]);
     setQuestion("");
-    setAsking(true);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60_000);
 
     try {
-      const res = await axios.post(`${API_BASE}/ask`, {
-        question,
-        doc_ids: selectedDocs,
-        sessionId,
-      });
+      const res = await axios.post(
+        `${API_BASE}/ask`,
+        {
+          question,
+          sessionId,
+          doc_ids: selectedDocs,
+        },
+        { signal: controller.signal }
+      );
 
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.answer },
       ]);
-    } catch {
-      setChatHistory((prev) => [
-        ...prev,
-        { role: "bot", text: "Error getting answer." },
-      ]);
+    } catch (e) {
+      const msg =
+        e.name === "AbortError" || e.code === "ECONNABORTED"
+          ? "Request timed out."
+          : "Error getting answer.";
+      setChatHistory((prev) => [...prev, { role: "bot", text: msg }]);
+    } finally {
+      clearTimeout(timeoutId);
+      setAsking(false);
     }
-
-    setAsking(false);
   };
 
   // -------------------------------
@@ -152,22 +169,20 @@ function App() {
     if (selectedDocs.length === 0) return;
 
     setSummarizing(true);
-
     try {
       const res = await axios.post(`${API_BASE}/summarize`, {
-        doc_ids: selectedDocs,
         sessionId,
+        doc_ids: selectedDocs,
       });
-
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.summary },
       ]);
     } catch {
       alert("Error summarizing.");
+    } finally {
+      setSummarizing(false);
     }
-
-    setSummarizing(false);
   };
 
   // -------------------------------
@@ -177,13 +192,11 @@ function App() {
     if (selectedDocs.length < 2) return;
 
     setComparing(true);
-
     try {
       const res = await axios.post(`${API_BASE}/compare`, {
-        doc_ids: selectedDocs,
         sessionId,
+        doc_ids: selectedDocs,
       });
-
       setComparisonResult(res.data.comparison);
       setChatHistory((prev) => [
         ...prev,
@@ -191,63 +204,32 @@ function App() {
       ]);
     } catch {
       alert("Error comparing documents.");
+    } finally {
+      setComparing(false);
     }
-
-    setComparing(false);
   };
 
   // -------------------------------
-  // UI helpers
+  // Helpers
   // -------------------------------
+  const selectedPdfs = pdfs.filter((p) => selectedDocs.includes(p.doc_id));
   const pageBg = darkMode ? "bg-dark text-light" : "bg-light text-dark";
   const cardClass = darkMode
     ? "text-white border-secondary shadow"
     : "bg-white text-dark border-0 shadow-sm";
-
   const inputClass = darkMode ? "text-white border-secondary" : "";
 
   // -------------------------------
   // Render
   // -------------------------------
   return (
-    <div
-      className={pageBg}
-      style={{
-        minHeight: "100vh",
-        "--bs-card-bg": darkMode ? "#2c2c2c" : "#ffffff",
-        "--bs-body-bg": darkMode ? "#1e1e1e" : "#f8f9fa",
-      }}
-    >
-      {/* Navbar */}
-      <Navbar
-        bg={darkMode ? "dark" : "primary"}
-        variant="dark"
-        className="shadow mb-4 bg-gradient"
-      >
-        <Container className="d-flex justify-content-between align-items-center">
-          <Navbar.Brand className="fw-bold d-flex align-items-center gap-2">
-            <span role="img" aria-label="Bot">
-              🤖
-            </span>
-            Document Q&A Bot
-          </Navbar.Brand>
-          <div className="d-flex align-items-center gap-2">
-            <span className="text-white small">
-              {darkMode ? "⭐ Dark" : "🔆 Light"}
-            </span>
-            <div className="form-check form-switch mb-0">
-              <input
-                className="form-check-input"
-                type="checkbox"
-                role="switch"
-                id="darkModeToggle"
-                checked={darkMode}
-                onChange={() => setDarkMode(!darkMode)}
-                aria-label="Toggle dark/light mode"
-                style={{ cursor: "pointer", width: "40px", height: "22px" }}
-              />
-            </div>
-          </div>
+    <div className={pageBg} style={{ minHeight: "100vh" }}>
+      <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
+        <Container className="d-flex justify-content-between">
+          <Navbar.Brand>🤖 PDF Q&A Bot</Navbar.Brand>
+          <Button variant="outline-light" onClick={() => setDarkMode(!darkMode)}>
+            {darkMode ? "Light" : "Dark"}
+          </Button>
         </Container>
       </Navbar>
 
@@ -293,6 +275,24 @@ function App() {
               ))}
             </Card.Body>
           </Card>
+        )}
+
+        {/* Side-by-side preview */}
+        {selectedPdfs.length === 2 && (
+          <Row className="mb-4">
+            {selectedPdfs.map((pdf) => (
+              <Col md={6} key={pdf.doc_id}>
+                <Card className={cardClass}>
+                  <Card.Body>
+                    <h6>{pdf.name}</h6>
+                    <Document file={pdf.url}>
+                      <Page pageNumber={1} />
+                    </Document>
+                  </Card.Body>
+                </Card>
+              </Col>
+            ))}
+          </Row>
         )}
 
         {/* Chat */}
