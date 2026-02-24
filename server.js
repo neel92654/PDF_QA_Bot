@@ -5,7 +5,7 @@ const axios = require("axios");
 const axiosRetry = require("axios-retry").default;
 const path = require("path");
 const rateLimit = require("express-rate-limit");
-const crypto = require("crypto");
+
 const { fileTypeFromFile } = require("file-type");
 const fs = require("fs");
 
@@ -34,18 +34,7 @@ app.use(cors());
 app.use(express.json());
 
 
-const upload = multer({
-  dest: "uploads/",
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB cap
-  fileFilter: (req, file, cb) => {
-    const fileExt = path.extname(file.originalname).toLowerCase();
-    if (file.mimetype === "application/pdf" && fileExt === ".pdf") {
-      cb(null, true);
-    } else {
-      cb(new Error("INVALID_TYPE"), false);
-    }
-  },
-});
+
 
 // ------------------------------------------------------------------
 // SESSION (per-user chat history)
@@ -207,12 +196,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Unsupported file type." });
     }
 
-    //Ensure file is not empty
-    const stats = fs.statSync(filePath);
-    if (stats.size === 0) {
-      fs.unlinkSync(filePath); // Delete the empty file
-      return res.status(400).json({ error: "Uploaded PDF is empty." });
-    }
+
 
     //Ensure file stays in uploads directory and is not executable
     if (!filePath.startsWith(UPLOAD_DIR)) {
@@ -220,7 +204,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Invalid file path." });
     }
 
-    await axios.post(
+    const response = await axios.post(
       "http://localhost:5000/process-pdf",
       { filePath, session_id: sessionId },
       { timeout: API_REQUEST_TIMEOUT }
@@ -352,9 +336,9 @@ app.use((err, req, res, next) => {
       error: "File too large. Maximum allowed size is 20MB.",
     });
   }
-  if (err.message === "INVALID_TYPE") {
+  if (err.message.includes("Unsupported file type")) {
     return res.status(400).json({
-      error: "Invalid file type. Only PDF files are accepted.",
+      error: err.message,
     });
   }
   next(err);
@@ -365,4 +349,3 @@ app.use((err, req, res, next) => {
 app.listen(4000, () => {
   console.log("Backend running on http://localhost:4000");
 });
-
