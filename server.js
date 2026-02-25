@@ -3,11 +3,13 @@ const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
 const axiosRetry = require("axios-retry").default;
+const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const { fileTypeFromFile } = require("file-type");
-const fs = require("fs");
+
+const app = express(); // Trust first proxy for rate limiting if behind a proxy
 const session = require("express-session");
 require("dotenv").config();
 
@@ -95,7 +97,10 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 // ------------------------------------------------------------------
 // MULTER CONFIG
 // ------------------------------------------------------------------
+
 const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
+const PDF_MIME_TYPE = "application/pdf";
+const PDF_MAGIC = "%PDF"
 
 const storage = multer.diskStorage({
   destination: "uploads/",
@@ -112,19 +117,46 @@ const upload = multer({
   storage,
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (SUPPORTED_EXTENSIONS.includes(ext)) {
+    const safeName = path.basename(file.originalname);
+    const ext = path.extname(safeName).toLowerCase();
+    if (SUPPORTED_EXTENSIONS.includes(ext) && file.mimetype === PDF_MIME_TYPE) {
       cb(null, true);
     } else {
-      cb(new Error("Unsupported file type"));
+      cb(new Error("Only PDF files are supported."));
     }
   },
 });
 
+
+const uploadSingle = (req, res, next) => {
+  upload.single("file")(req, res, (err) => {
+    if (!err) {
+      return next();
+    }
+
+    if (err instanceof multer.MulterError) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    return res.status(400).json({ error: err.message || "Invalid upload." });
+  });
+};
+
+const hasPdfMagicNumber = async (filePath) => {
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(4);
+    const { bytesRead } = await handle.read(buffer, 0, 4, 0);
+    return bytesRead === 4 && buffer.toString("ascii") === PDF_MAGIC;
+  } finally {
+    await handle.close();
+  }
+}
+
 // ------------------------------------------------------------------
 // ROUTE: UPLOAD
 // ------------------------------------------------------------------
-app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+app.post("/upload", uploadLimiter, uploadSingle, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -135,7 +167,18 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     const sessionId = crypto.randomUUID();
     const filePath = path.resolve(req.file.path);
 
-    // 🔐 Magic byte validation
+    if (req.file.mimetype !== PDF_MIME_TYPE || !req.file.originalname.toLowerCase().endsWith(".pdf")) {
+      await fs.promises.unlink(filePath).catch(() => {});
+      return res.status(400).json({ error: "Only PDF files are supported." });
+    }
+
+    const isPdf = await hasPdfMagicNumber(filePath);
+    if (!isPdf) {
+      await fs.promises.unlink(filePath).catch(() => {});
+      return res.status(400).json({ error: "Only PDF files are supported." });
+    }
+
+    //Magic byte check to ensure it's a PDF
     const ext = path.extname(filePath).toLowerCase();
     const detectedType = await fileTypeFromFile(filePath);
 
