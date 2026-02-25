@@ -17,6 +17,10 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoM
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+# Post-processing helper: strips prompt echoes / context leakage from LLM output
+# so that the API always returns only the clean, user-facing answer.
+from utils.postprocess import extract_final_answer
+
 load_dotenv()
 
 app = FastAPI()
@@ -83,58 +87,6 @@ def normalize_spaced_text(text: str) -> str:
     return re.sub(pattern, fix_spaced_word, text)
 
 
-def extract_clean_answer(raw: str) -> str:
-    """
-    Robustly extracts only the final answer from LLM output.
-
-    Strategy (applied in order):
-    1.  If the text contains an 'Answer:' marker, take everything after it.
-    2.  Strip lines that are clearly prompt echoes (Context:, Question:, Instructions:, etc.)
-    3.  Remove leading/trailing whitespace and collapse excessive blank lines.
-    4.  Normalize any residual character-level spacing.
-    """
-    # ── Step 1: Extract text after "Answer:" marker if present ───────────────
-    answer_marker = re.search(
-        r'(?:^|\n)\s*Answer\s*[:\-]?\s*\n?(.*)',
-        raw,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-    if answer_marker:
-        raw = answer_marker.group(1).strip()
-
-    # ── Step 2: Drop lines that are clearly prompt/context echoes ────────────
-    ECHO_PATTERNS = [
-        r'^\s*Context\s*[:\-]',
-        r'^\s*Question\s*[:\-]',
-        r'^\s*Instructions?\s*[:\-]',
-        r'^\s*Conversation\s+History\s*[:\-]',
-        r'^\s*Document\s+Context\s*[:\-]',
-        r'^\s*Current\s+Question\s*[:\-]',
-        r'^\s*You are a helpful',
-        r'^\s*Use the document',
-        r'^\s*If the answer is not',
-        r'^\s*Keep the answer',
-        r'^\s*RULES\s*[:\-]',
-        r'^\s*Summary\s*\(bullet',
-        r'^\s*-\s*Use ONLY',
-        r'^\s*-\s*Summarize in',
-        r'^\s*-\s*Clearly distinguish',
-        r'^\s*-\s*Return clean',
-    ]
-    combined = re.compile('|'.join(ECHO_PATTERNS), re.IGNORECASE)
-    lines = raw.splitlines()
-    cleaned_lines = [ln for ln in lines if not combined.match(ln)]
-    raw = '\n'.join(cleaned_lines)
-
-    # ── Step 3: Collapse excessive whitespace ─────────────────────────────────
-    raw = re.sub(r'[ \t]{2,}', ' ', raw)
-    raw = re.sub(r'\n{3,}', '\n\n', raw)
-    raw = raw.strip()
-
-    # ── Step 4: Normalize residual character-level spacing ───────────────────
-    raw = normalize_spaced_text(raw)
-
-    return raw if raw else "I could not find a relevant answer in the document."
 
 
 # ---------------------------------------------------------------------------
@@ -329,8 +281,9 @@ def ask_question(request: Request, data: AskRequest):
     )
 
     raw_answer = generate_response(prompt, max_new_tokens=150)
-    answer = extract_clean_answer(raw_answer)
-    return {"answer": answer}
+    # Post-process: remove prompt echoes / context leakage; return clean answer only.
+    clean_answer = extract_final_answer(raw_answer)
+    return {"answer": clean_answer}
 
 
 @app.post("/summarize")
@@ -364,7 +317,8 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     )
 
     raw_summary = generate_response(prompt, max_new_tokens=300)
-    summary = extract_clean_answer(raw_summary)
+    # Post-process: strip any leaked prompt sections from the generated summary.
+    summary = extract_final_answer(raw_summary)
     return {"summary": summary}
 
 
@@ -409,7 +363,8 @@ def compare_documents(request: Request, data: CompareRequest):
     )
 
     raw = generate_response(prompt, max_new_tokens=400)
-    comparison = extract_clean_answer(raw)
+    # Post-process: ensure comparison output contains no leaked prompt text.
+    comparison = extract_final_answer(raw)
     return {"comparison": comparison}
 
 
