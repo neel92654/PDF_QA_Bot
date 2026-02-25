@@ -8,17 +8,25 @@ from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from groq import Groq
 from dotenv import load_dotenv
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from pathlib import Path
+import uvicorn
+import torch
 import os
 import re
-import uvicorn
 import time
 from pathlib import Path
 
-# -------------------------------------------------------------------
+# ===============================
 # APP SETUP
-# -------------------------------------------------------------------
+# ===============================
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,30 +36,51 @@ app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
-# ---------------------------------------------------------------------------
-# GROQ CLIENT SETUP
-# ---------------------------------------------------------------------------
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# Initialize Groq client (will fail on API calls if key is invalid)
-groq_client = None
-if GROQ_API_KEY and GROQ_API_KEY != "your_groq_api_key_here":
-    try:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-    except Exception as e:
-        print(f"Warning: Could not initialize Groq client: {e}")
-else:
-    print("Warning: GROQ_API_KEY not set or placeholder. Set a valid key in .env file.")
-
-# Session management
 sessions = {}
-SESSION_TIMEOUT = 3600  # 1 hour
 
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
+
+SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"]
+
+# -------------------------------------------------------------------
+# DOCUMENT LOADERS
+# -------------------------------------------------------------------
+def load_pdf(file_path: str) -> list[Document]:
+    loader = PyPDFLoader(file_path)
+    return loader.load()
+
+def load_docx(file_path: str) -> list[Document]:
+    import docx
+    doc = docx.Document(file_path)
+    texts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                texts.extend([p.text.strip() for p in cell.paragraphs if p.text.strip()])
+    full_text = "\n".join(texts)
+    return [Document(page_content=full_text, metadata={"source": file_path})]
+
+def load_txt(file_path: str) -> list[Document]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return [Document(page_content=content, metadata={"source": file_path})]
+
+def load_document(file_path: str) -> list[Document]:
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return load_pdf(file_path)
+    elif ext == ".docx":
+        return load_docx(file_path)
+    elif ext in (".txt", ".md"):
+        return load_txt(file_path)
+    else:
+        raise ValueError(f"Unsupported format: {ext}")
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
 
 # -------------------------------------------------------------------
 # DOCUMENT PROCESSING SETUP
@@ -83,14 +112,8 @@ def load_document(file_path: str):
 # TEXT NORMALIZATION
 # -------------------------------------------------------------------
 def normalize_spaced_text(text: str) -> str:
-    """
-    Fixes character-level spaced text produced by PyPDFLoader on certain
-    vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
-    """
-    def fix_spaced_word(match):
-        return match.group(0).replace(" ", "")
     pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
-    return re.sub(pattern, fix_spaced_word, text)
+
 
 
 def normalize_answer(text: str) -> str:
@@ -98,270 +121,182 @@ def normalize_answer(text: str) -> str:
     Post-processes the LLM-generated answer.
     """
     text = normalize_spaced_text(text)
-    # Strip only clear prompt-echo artefacts at the very start
-    text = re.sub(r'^(Final Answer:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'[ \t]{2,}', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r"^(Answer[^:]*:|Context:|Question:)\s*", "", text, flags=re.I)
     return text.strip()
 
 
-# ---------------------------------------------------------------------------
-# CCC PROMPT TEMPLATE (Connect – Content – Continue)
-# ---------------------------------------------------------------------------
-
-_CCC_SYSTEM = (
-    "You are an intelligent PDF Question Answering Assistant.\n"
-    "Your task is to answer the user's question strictly using the provided context "
-    "retrieved from uploaded documents.\n\n"
-    "Follow the CCC communication structure in a SINGLE response:\n\n"
-    "1. Context Connection — Start with a short professional greeting (e.g. \"Hello,\").\n"
-    "2. Content Explanation — Rewrite the retrieved context in clear, meaningful, "
-    "grammatically correct sentences. Do NOT copy text directly.\n"
-    "3. Core Answer — Present the main explanation in a structured, readable format.\n"
-    "4. Call to Action — End with a relevant follow-up question to encourage further exploration.\n\n"
-    "Rules:\n"
-    "- Use ONLY the provided context. Do NOT add external knowledge.\n"
-    "- If the answer is not in the context, say: "
-    "\"The uploaded document does not contain sufficient information to answer this question.\"\n"
-    "- Maintain a clear, professional tone.\n"
-    "- Produce one continuous response — no bullet headers like '1.' or '2.'."
-)
-
-_CCC_USER_TEMPLATE = """\
-Context from the uploaded PDF:
-{context}
-
-Question:
-{question}
-
-Final Answer:"""
-
-CCC_PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template=_CCC_USER_TEMPLATE,
-)
+# ===============================
+# DOCUMENT LOADERS
+# ===============================
+def load_pdf(file_path: str):
+    return PyPDFLoader(file_path).load()
 
 
-# ---------------------------------------------------------------------------
-# GROQ GENERATION
-# ---------------------------------------------------------------------------
-
-def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
-    """
-    Calls the Groq chat-completions API with a system + user message pair.
-    """
-    if not groq_client:
-        return "Error: Groq API not configured. Please set GROQ_API_KEY in .env file."
-    
-    try:
-        completion = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.3,
-        )
-        return completion.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
+def load_txt(file_path: str):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return [Document(page_content=f.read())]
 
 
-# -------------------------------------------------------------------
+def load_docx(file_path: str):
+    doc = docx.Document(file_path)
+    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    return [Document(page_content=text)]
+
+
+def load_document(file_path: str):
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return load_pdf(file_path)
+    elif ext == ".docx":
+        return load_docx(file_path)
+    elif ext in [".txt", ".md"]:
+        return load_txt(file_path)
+    else:
+        raise ValueError("Unsupported file format")
+
+
+
+    if is_enc:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return tokenizer.decode(
+        output[0][encoded["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
+
+
+# ===============================
 # REQUEST MODELS
-# -------------------------------------------------------------------
-
+# ===============================
 class DocumentPath(BaseModel):
     filePath: str
     session_id: str
 
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000)
+    question: str = Field(..., min_length=1)
     session_id: str
     history: list = []
+
+    @validator("question")
+    def validate_question(cls, v):
+        if not v.strip():
+            raise ValueError("Empty question")
+        return v.strip()
+
 
 class SummarizeRequest(BaseModel):
     session_id: str
     pdf: str | None = None
 
 
+
+class CompareRequest(BaseModel):
+    session_id: str
+
 # -------------------------------------------------------------------
 # SESSION CLEANUP
 # -------------------------------------------------------------------
+
+
 def cleanup_expired_sessions():
     now = time.time()
-    expired = [
-        sid for sid, s in sessions.items()
-        if now - s["last_accessed"] > SESSION_TIMEOUT
-    ]
-    for sid in expired:
-        del sessions[sid]
+    expired = [k for k, v in sessions.items()
+               if now - v["last"] > SESSION_TIMEOUT]
+    for k in expired:
+        del sessions[k]
 
-# -------------------------------------------------------------------
-# ENDPOINTS
-# ---------------------------------------------------------------------------
 
-@app.post("/process-pdf")
+# ===============================
+# PROCESS DOCUMENT
+# ===============================
+@app.post("/process")
 @limiter.limit("15/15 minutes")
-def process_pdf(request: Request, data: DocumentPath):
-    cleanup_expired_sessions()
+def process_doc(request: Request, data: DocumentPath):
+    cleanup_sessions()
 
-    # Resolve and validate path (prevent path traversal)
-    file_path = Path(data.filePath).resolve()
+    if not os.path.exists(data.filePath):
+        raise HTTPException(404, "File not found")
 
-    if not str(file_path).startswith(str(UPLOAD_DIR)):
-        raise HTTPException(status_code=400, detail="Invalid file path")
+    docs = load_document(data.filePath)
 
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Document not found")
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150,
+    )
+    chunks = splitter.split_documents(docs)
 
-    ext = file_path.suffix.lower()
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format: {ext}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
-        )
+    vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-    try:
-        raw_docs = load_document(str(file_path))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
+    if data.session_id in sessions:
+        # Append to existing vectorstore
+        sessions[data.session_id]["vectorstore"].add_documents(chunks)
+        sessions[data.session_id]["last_accessed"] = time.time()
+    else:
+        # Create new vectorstore
+        sessions[data.session_id] = {
+            "vectorstore": FAISS.from_documents(chunks, embedding_model),
+            "last_accessed": time.time(),
+        }
 
-    cleaned_docs = []
-    for doc in raw_docs:
-        cleaned_content = normalize_spaced_text(doc.page_content)
-        cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
+    return {"message": "Processed successfully"}
 
-    chunks = splitter.split_documents(cleaned_docs)
-
-    if not chunks:
-        raise HTTPException(
-            status_code=400,
-            detail="No text extracted from the document."
-        )
-
-    sessions[data.session_id] = {
-        "vectorstore": FAISS.from_documents(chunks, embedding_model),
-        "last_accessed": time.time(),
-    }
-
-    return {"message": "Document processed successfully"}
 
 # ===============================
-# RELEVANCE CONFIGURATION
+# ASK
 # ===============================
-# Uses cosine similarity (0 to 1) instead of raw L2 distance.
-# 0.0 = completely unrelated, 1.0 = identical match.
-# NOTE: The conversion from FAISS scores to cosine similarity assumes that
-# embeddings are L2-normalized and that FAISS uses IndexFlatL2 (L2 squared).
-RELEVANCE_THRESHOLD = 0.25  # Minimum cosine similarity for relevance
-
-
-def faiss_score_to_cosine_sim(score: float) -> float:
-    """Convert a FAISS L2 squared distance score to cosine similarity.
-
-    Assumptions:
-    - Embedding vectors are L2-normalized (||v|| = 1). True for many
-      sentence-transformer models including all-MiniLM-L6-v2.
-    - The FAISS index returns L2 squared distances (e.g., IndexFlatL2).
-
-    Under these conditions:
-        ||u - v||^2 = 2 - 2 * cos(theta)
-        => cos(theta) = 1 - (||u - v||^2 / 2)
-
-    The returned value is clamped to [0.0, 1.0] for numerical stability.
-    """
-    return max(0.0, 1.0 - score / 2.0)
-
-
-def compute_confidence(faiss_scores: list[float]) -> float:
-    """Compute confidence (0-100%) from FAISS scores using the top-3 chunks.
-
-    The provided FAISS scores are assumed to be L2 squared distances for
-    L2-normalized embeddings (see ``faiss_score_to_cosine_sim``). Scores are
-    converted to cosine similarities and the top-3 most relevant chunks are
-    averaged to produce a confidence value in percent.
-    """
-    if not faiss_scores:
-        return 0.0
-    top_scores = sorted(faiss_scores)[:3]
-    similarities = [faiss_score_to_cosine_sim(s) for s in top_scores]
-    avg_sim = sum(similarities) / len(similarities)
-    return round(float(avg_sim * 100), 1)
-
-
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(request: Request, data: AskRequest):
-    cleanup_expired_sessions()
+def ask(request: Request, data: AskRequest):
+    cleanup_sessions()
 
-    session_data = sessions.get(data.session_id)
-    if not session_data:
-        return {"answer": "Session expired or no PDF uploaded for this session!", "confidence_score": 0}
+    session = sessions.get(data.session_id)
+    if not session:
+        return {"answer": "Session expired", "confidence_score": 0}
 
-    session_data["last_accessed"] = time.time()
-    vectorstore = session_data["vectorstore"]
+    vectorstore = session["vectorstore"]
 
-    question = data.question
-    history = data.history
+    docs = vectorstore.similarity_search_with_score(data.question, k=4)
 
-    conversation_context = ""
-    for msg in history[-5:]:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        conversation_context += f"{role}: {content}\n"
+    docs_with_scores = vectorstore.similarity_search_with_score(question, k=4)
+    if not docs_with_scores:
+        return {"answer": "No relevant context found in the uploaded document.", "confidence_score": 0}
 
-    docs = vectorstore.similarity_search_with_scores(question, k=4)
-    if not docs:
-        return {"answer": "No relevant context found in the uploaded document."}
+    # Convert FAISS scores to cosine similarities
+    scored = [(doc, score, faiss_score_to_cosine_sim(score)) for doc, score in docs_with_scores]
+    similarities = [sim for _, _, sim in scored]
+    confidence = compute_confidence([score for _, score, _ in scored])
 
-    doc_list = [doc for doc, _ in docs]
-    faiss_scores = [score for _, score in docs]
-    context = "\n\n".join([doc.page_content for doc in doc_list])
-    confidence = compute_confidence(faiss_scores)
 
-    question_with_history = question
-    if conversation_context.strip():
-        question_with_history = (
-            f"Conversation so far:\n{conversation_context.strip()}\n\n"
-            f"Current Question: {question}"
-        )
+
+    Question:
+    {data.question}
 
     user_prompt = CCC_PROMPT.format(
         context=context,
         question=question_with_history,
     )
 
-    raw_answer = generate_response(
-        system_prompt=_CCC_SYSTEM,
-        user_prompt=user_prompt,
-        max_tokens=600,
-    )
+    answer = generate_response(prompt, 150)
 
-    answer = normalize_answer(raw_answer)
-    return {"answer": answer, "confidence_score": confidence}
+    session["last"] = time.time()
 
+    return {"answer": normalize_answer(answer), "confidence_score": 85}
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, data: SummarizeRequest):
+async def summarize_pdf(request: Request, data: SummarizeRequest):
     cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
-    session = sessions.get(data.session_id)
-    if not session:
-        return {"summary": "Session expired or PDF not uploaded"}
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
 
-    session["last_accessed"] = time.time()
-    vectorstore = session["vectorstore"]
-
-
-    docs = vectorstore.similarity_search("Summarize the document.", k=6)
-    if not docs:
-        return {"summary": "No content available"}
-
-    context = "\n\n".join([doc.page_content for doc in docs])
+    # Extract all text from the vectorstore for summarization
+    all_docs = list(vectorstore.docstore._dict.values())
+    full_text = "\n".join([doc.page_content for doc in all_docs])
 
     system_prompt = (
         "You are a document summarization assistant.\n"
@@ -373,15 +308,72 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
         "4. Use ONLY the information in the provided context."
     )
 
-    user_prompt = f"Context:\n{context}\n\nSummary (bullet points):"
+    user_prompt = f"Content:\n{full_text[:4000]}\n\nSummary (bullet points):"
 
-    raw_summary = generate_response(
+    return {"summary": normalize_answer(summary)}
+
+
+@app.post("/compare")
+@limiter.limit("15/15 minutes")
+async def compare_documents(request: Request, data: CompareRequest):
+    """
+    Compare multiple documents within a session.
+    Groups chunks by their source metadata and generates a comparative summary.
+    """
+    cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
+
+    # Extract all documents from the FAISS internal docstore
+    try:
+        all_docs = list(vectorstore.docstore._dict.values())
+    except Exception:
+        all_docs = []
+
+    if not all_docs:
+        return {"comparison": "No documents found to compare."}
+
+    # Group chunks by their source file
+    docs_by_source = {}
+    for doc in all_docs:
+        source = doc.metadata.get("source", "Unknown")
+        if source not in docs_by_source:
+            docs_by_source[source] = []
+        docs_by_source[source].append(doc.page_content)
+
+    sources = list(docs_by_source.keys())
+    if len(sources) < 2:
+        return {"comparison": "Please upload at least two documents to generate a comparison."}
+
+    # Prepare context for comparison
+    comparison_context = ""
+    for i, source in enumerate(sources):
+        filename = Path(source).name
+        content_sample = "\n".join(docs_by_source[source])[:1500]
+        comparison_context += f"--- Document {i+1}: {filename} ---\n{content_sample}\n\n"
+
+    system_prompt = "You are a professional analyst comparing multiple documents."
+    user_prompt = f"""
+    Please compare the following documents:
+
+    {comparison_context}
+
+    Instructions:
+    - Identify key similarities and differences.
+    - Format as a structured comparison (bullet points/sections).
+    - Be objective and concise.
+    """
+
+    comparison_result = generate_response(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        max_tokens=512
+        max_tokens=800
     )
-    summary = normalize_answer(raw_summary)
-    return {"summary": summary}
+    return {"comparison": comparison_result}
 
 
 # -------------------------------------------------------------------
