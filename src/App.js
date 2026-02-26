@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from "react";
 import axios from "axios";
 import { Container, Typography, Box, Button, TextField, Paper, Avatar, CircularProgress, AppBar, Toolbar, IconButton } from "@mui/material";
@@ -35,6 +34,26 @@ function App() {
     localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(chat));
   }, [chat]);
 
+  const handleFileChange = (event) => {
+    const selectedFile = event.target.files && event.target.files[0];
+    if (!selectedFile) {
+      setFile(null);
+      return;
+    }
+
+    const name = selectedFile.name.toLowerCase();
+    const isAllowed = name.endsWith(".pdf") || name.endsWith(".docx") || name.endsWith(".txt") || name.endsWith(".md");
+
+    if (!isAllowed) {
+      alert("Only PDF, DOCX, TXT, and MD files are supported.");
+      event.target.value = "";
+      setFile(null);
+      return;
+    }
+
+    setFile(selectedFile);
+  };
+
   const uploadPDF = async () => {
     if (!file || !sessionId) return;
     setUploading(true);
@@ -57,11 +76,11 @@ function App() {
     setAsking(true);
     const userMsg = { role: "user", text: question };
     setChat(prev => [...prev, userMsg]);
-    
+
     try {
-      const res = await axios.post("http://localhost:4000/ask", { 
+      const res = await axios.post("http://localhost:4000/ask", {
         question: question.trim(),
-        sessionId: sessionId 
+        sessionId: sessionId
       });
       setChat(prev => [...prev, { role: "bot", text: res.data.answer }]);
     } catch (e) {
@@ -103,7 +122,12 @@ function App() {
             disabled={uploading}
           >
             Select PDF
-            <input type="file" hidden onChange={(e) => setFile(e.target.files[0])} accept=".pdf,.docx,.txt,.md" />
+            <input
+              type="file"
+              hidden
+              accept=".pdf,.docx,.txt,.md"
+              onChange={handleFileChange}
+            />
           </Button>
           <Button variant="outlined" onClick={uploadPDF} disabled={!file || uploading}>
             {uploading ? <CircularProgress size={24} /> : "Upload"}
@@ -172,4 +196,3 @@ function App() {
 }
 
 export default App;
-
