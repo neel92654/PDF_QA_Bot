@@ -15,7 +15,7 @@ import time
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from core.config import SESSION_TIMEOUT, UPLOAD_DIR
+from core.config import SESSION_TIMEOUT
 from services.document_service import chunk_documents, load_pdf
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def _ensure_faiss() -> bool:
 
         _FAISS = FAISS
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 – broken transitive deps can raise NameError etc.
         logger.warning("FAISS unavailable: %s", exc)
         return False
 
@@ -52,7 +52,7 @@ def _ensure_embeddings() -> bool:
 
         _HuggingFaceEmbeddings = HuggingFaceEmbeddings
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 – broken transitive deps can raise NameError etc.
         logger.warning("HuggingFaceEmbeddings unavailable: %s", exc)
         return False
 
@@ -104,7 +104,7 @@ class _DummyVectorStore:
 # Session storage
 # ---------------------------------------------------------------------------
 # Format: { session_id: { "vectorstores": [store, ...], "last_accessed": float } }
-_sessions: Dict[str, Dict] = {}
+_sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 
 
@@ -255,13 +255,18 @@ def get_context_per_session(
         One concatenated context string per found session (same order as
         *session_ids*).
     """
-    contexts: List[str] = []
+    # Snapshot vectorstore references inside the lock (fast), then search
+    # outside the lock to avoid blocking other threads during inference.
+    stores: List[Any] = []
     with _sessions_lock:
         for sid in session_ids:
             session = _sessions.get(sid)
             if session:
                 session["last_accessed"] = time.time()
-                vs = session["vectorstores"][0]
-                chunks = vs.similarity_search(query, k=k)
-                contexts.append("\n".join(c.page_content for c in chunks))
+                stores.append(session["vectorstores"][0])
+
+    contexts: List[str] = []
+    for vs in stores:
+        chunks = vs.similarity_search(query, k=k)
+        contexts.append("\n".join(c.page_content for c in chunks))
     return contexts

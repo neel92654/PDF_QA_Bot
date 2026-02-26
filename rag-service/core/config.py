@@ -9,9 +9,8 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: F401
+from slowapi import Limiter
 from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Load .env (no-op if the file is absent)

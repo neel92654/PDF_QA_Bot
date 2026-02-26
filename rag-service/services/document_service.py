@@ -31,7 +31,7 @@ def _ensure_pdf_loader() -> bool:
 
         _PyPDFLoader = PyPDFLoader
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 – broken transitive deps can raise NameError etc.
         logger.warning("PyPDFLoader unavailable: %s", exc)
         return False
 
@@ -48,7 +48,7 @@ def _ensure_splitter() -> bool:
 
         _RecursiveCharacterTextSplitter = RecursiveCharacterTextSplitter
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 – broken transitive deps can raise NameError etc.
         logger.warning("RecursiveCharacterTextSplitter unavailable: %s", exc)
         return False
 
@@ -61,6 +61,7 @@ class _SimpleDoc:
 
     def __init__(self, text: str) -> None:
         self.page_content = text
+        self.metadata: dict = {}
 
 
 # ---------------------------------------------------------------------------

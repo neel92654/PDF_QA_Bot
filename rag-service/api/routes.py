@@ -54,8 +54,8 @@ def health():
 # ---------------------------------------------------------------------------
 # Upload
 # ---------------------------------------------------------------------------
-def _handle_upload(file: UploadFile) -> dict:
-    """Shared logic for both authenticated and anonymous upload endpoints."""
+def _handle_upload(file: UploadFile) -> tuple[str, str]:
+    """Validate the uploaded file and return ``(filename, destination_path)``."""
     filename = os.path.basename(file.filename or "")
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -65,12 +65,9 @@ def _handle_upload(file: UploadFile) -> dict:
     return filename, file_path
 
 
-@router.post("/upload", tags=["documents"])
-@limiter.limit("10/15 minutes")
-async def upload_file(request: Request, file: UploadFile = File(...)):
-    """Upload a PDF, process it, and return a session ID."""
+async def _do_upload(file: UploadFile) -> dict:
+    """Core upload logic shared by /upload and /upload/anonymous."""
     filename, file_path = _handle_upload(file)
-
     try:
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
@@ -91,29 +88,18 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="Upload failed")
 
 
+@router.post("/upload", tags=["documents"])
+@limiter.limit("10/15 minutes")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    """Upload a PDF, process it, and return a session ID."""
+    return await _do_upload(file)
+
+
 @router.post("/upload/anonymous", tags=["documents"])
 @limiter.limit("10/15 minutes")
 async def upload_anonymous(request: Request, file: UploadFile = File(...)):
     """Anonymous upload endpoint – identical behaviour to /upload."""
-    filename, file_path = _handle_upload(file)
-
-    try:
-        with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
-
-        session_id = create_session_from_file(file_path)
-        return {"message": "PDF uploaded and processed", "session_id": session_id}
-
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Anonymous upload failed for file '%s'", filename)
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=500, detail="Upload failed")
+    return await _do_upload(file)
 
 
 # ---------------------------------------------------------------------------

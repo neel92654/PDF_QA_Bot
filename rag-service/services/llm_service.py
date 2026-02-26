@@ -10,7 +10,6 @@ installed.
 """
 
 import logging
-from typing import Optional
 
 from core.config import HF_GENERATION_MODEL
 
@@ -50,7 +49,7 @@ def _ensure_transformers_imports() -> bool:
         _AutoModelForSeq2SeqLM = AutoModelForSeq2SeqLM
         _AutoModelForCausalLM = AutoModelForCausalLM
         return True
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:  # noqa: BLE001 – broken transitive deps can raise NameError etc.
         logger.warning("Could not import transformers: %s", exc)
         return False
 
@@ -82,14 +81,14 @@ def load_generation_model() -> bool:
         else:
             _model = _AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
 
-        # Move to CUDA if available
+        # Move to CUDA if available; fall back to CPU gracefully
         try:
             import torch as _torch  # type: ignore
 
             if getattr(_torch, "cuda", None) and _torch.cuda.is_available():
                 _model.to("cuda")
-        except Exception:
-            pass  # CPU-only fallback
+        except (ImportError, RuntimeError, OSError) as exc:
+            logger.debug("CUDA unavailable, using CPU: %s", exc)
 
         _model.eval()
         logger.info("LLM loaded: %s (encoder-decoder=%s)", HF_GENERATION_MODEL, _is_encoder_decoder)
