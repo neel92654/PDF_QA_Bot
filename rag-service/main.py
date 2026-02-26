@@ -12,54 +12,51 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from uuid import uuid4
-import os
-import time
-import uuid
-import torch
-import uvicorn
+@app.post("/upload")
+@limiter.limit("10/15 minutes")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    try:
+        file_bytes = await file.read()
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_bytes)
 
-# IMPORTANT: Authentication REMOVED as per issue requirement
-# (Authentication was breaking existing endpoints)
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
 
-load_dotenv()
+        chunk_size = int(os.getenv("PDF_CHUNK_SIZE", 1000))
+        chunk_overlap = int(os.getenv("PDF_CHUNK_OVERLAP", 100))
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+        chunks = splitter.split_documents(docs)
 
-app = FastAPI(
-    title="PDF QA Bot API",
-    description="PDF Question-Answering Bot (Session-based, No Auth)",
-    version="2.1.0"
-)
+        for i, chunk in enumerate(chunks):
+            page_num = chunk.metadata.get("page", None)
+            chunk.metadata["page_number"] = page_num
+            chunk.metadata["file_name"] = file.filename
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-# Rate Limiter
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        sessions[session_id] = {
+            "vectorstores": [vectorstore],
+            "last_accessed": time.time()
+        }
 
-# ===============================
-# SESSION STORAGE (REQUIRED: keep sessionId)
-# ===============================
-# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
-sessions = {}
-SESSION_TIMEOUT = 3600  # 1 hour
-
-# Embedding model (loaded once)
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# ===============================
-# LOAD GENERATION MODEL ONCE
-# ===============================
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
-
+        return {
+            "message": "PDF uploaded and processed",
+            "session_id": session_id,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "chunks": [
+                {
+                    "page_content": chunk.page_content,
+                    "metadata": chunk.metadata
+                } for chunk in chunks[:5]
+            ]
+        }
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
 config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
 is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
 tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
@@ -152,17 +149,27 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
 
     try:
+        file_bytes = await file.read()
         with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
+            buffer.write(file_bytes)
 
         loader = PyPDFLoader(file_path)
         docs = loader.load()
 
+        # Configurable chunk size and overlap
+        chunk_size = int(os.getenv("PDF_CHUNK_SIZE", 1000))
+        chunk_overlap = int(os.getenv("PDF_CHUNK_OVERLAP", 100))
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
         )
+        # Add metadata (page number, file name) to each chunk
         chunks = splitter.split_documents(docs)
+        for i, chunk in enumerate(chunks):
+            # Try to get page number from source document metadata if available
+            page_num = chunk.metadata.get("page", None)
+            chunk.metadata["page_number"] = page_num
+            chunk.metadata["file_name"] = file.filename
 
         vectorstore = FAISS.from_documents(chunks, embedding_model)
 
@@ -263,34 +270,48 @@ def compare_documents(request: Request, data: CompareRequest):
     if len(data.session_ids) < 2:
         return {"comparison": "Select at least 2 documents."}
 
-    contexts = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vs = session["vectorstores"][0]
-            chunks = vs.similarity_search("main topics", k=4)
-            text = "\n".join([c.page_content for c in chunks])
-            contexts.append(text)
+    try:
+        file_bytes = await file.read()
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_bytes)
 
-    if len(contexts) < 2:
-        return {"comparison": "Not enough documents to compare."}
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
 
-    combined = "\n\n---\n\n".join(contexts)
+        # Configurable chunk size and overlap
+        chunk_size = int(os.getenv("PDF_CHUNK_SIZE", 1000))
+        chunk_overlap = int(os.getenv("PDF_CHUNK_OVERLAP", 100))
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+        chunks = splitter.split_documents(docs)
 
-    prompt = (
-        "Compare the documents below.\n"
-        "Give similarities and differences.\n\n"
-        f"{combined}\n\nComparison:"
-    )
+        # Ensure overlap and metadata for each chunk
+        for i, chunk in enumerate(chunks):
+            page_num = chunk.metadata.get("page", None)
+            chunk.metadata["page_number"] = page_num
+            chunk.metadata["file_name"] = file.filename
 
-    comparison = generate_response(prompt, 300)
-    return {"comparison": comparison}
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
 
+        sessions[session_id] = {
+            "vectorstores": [vectorstore],
+            "last_accessed": time.time()
+        }
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+        return {
+            "message": "PDF uploaded and processed",
+            "session_id": session_id,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "chunks": [
+                {
+                    "page_content": chunk.page_content,
+                    "metadata": chunk.metadata
+                } for chunk in chunks[:5]  # Show first 5 chunks for verification
+            ]
+        }
 
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000)
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
