@@ -15,6 +15,14 @@ from uuid import uuid4
 @app.post("/upload")
 @limiter.limit("10/15 minutes")
 async def upload_file(request: Request, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are supported"}
+
+    session_id = str(uuid4())
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+
     try:
         file_bytes = await file.read()
         with open(file_path, "wb") as buffer:
@@ -30,7 +38,6 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             chunk_overlap=chunk_overlap
         )
         chunks = splitter.split_documents(docs)
-
         for i, chunk in enumerate(chunks):
             page_num = chunk.metadata.get("page", None)
             chunk.metadata["page_number"] = page_num
@@ -45,15 +52,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
         return {
             "message": "PDF uploaded and processed",
-            "session_id": session_id,
-            "chunk_size": chunk_size,
-            "chunk_overlap": chunk_overlap,
-            "chunks": [
-                {
-                    "page_content": chunk.page_content,
-                    "metadata": chunk.metadata
-                } for chunk in chunks[:5]
-            ]
+            "session_id": session_id
         }
     except Exception as e:
         return {"error": f"Upload failed: {str(e)}"}
