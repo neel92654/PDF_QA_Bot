@@ -7,7 +7,6 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from dotenv import load_dotenv
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -15,7 +14,7 @@ from uuid import uuid4
 import os
 import time
 import uuid
-import torch
+import threading
 import uvicorn
 import pdf2image
 import pytesseract
@@ -51,35 +50,45 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ===============================
-# SESSION STORAGE (REQUIRED: keep sessionId)
+# SESSION STORAGE — per-session, no shared global vectorstore
 # ===============================
 # Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
-sessions = {}
+# Guard with a lock so concurrent requests never corrupt the dict.
+sessions: dict = {}
+_session_lock = threading.Lock()
 SESSION_TIMEOUT = 3600  # 1 hour
 
-# Embedding model (loaded once)
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+# Embedding model (loaded once — None if sentence-transformers is unavailable)\ntry:\n    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")\nexcept Exception:  # pragma: no cover\n    embedding_model = None
 
 # ===============================
-# LOAD GENERATION MODEL ONCE
+# GENERATION MODEL — loaded lazily; stays None when transformers unavailable
 # ===============================
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
 
-config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+_model = None
+_tokenizer = None
+_is_encoder_decoder = False
 
-if is_encoder_decoder:
-    model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
-else:
-    model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
-
-if torch.cuda.is_available():
-    model = model.to("cuda")
-
-model.eval()
+try:
+    import torch
+    from transformers import (
+        AutoConfig,
+        AutoTokenizer,
+        AutoModelForSeq2SeqLM,
+        AutoModelForCausalLM,
+    )
+    _cfg = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+    _is_encoder_decoder = bool(getattr(_cfg, "is_encoder_decoder", False))
+    _tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+    if _is_encoder_decoder:
+        _model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+    else:
+        _model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+    if torch.cuda.is_available():
+        _model = _model.to("cuda")
+    _model.eval()
+except Exception:  # transformers / model weights not available in this env
+    pass
 
 # ===============================
 # REQUEST MODELS
@@ -111,21 +120,31 @@ def cleanup_expired_sessions():
 
 
 def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
-    device = next(model.parameters()).device
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    """Run the generation model.
+
+    Raises
+    ------
+    RuntimeError
+        When the HF generation model is unavailable (missing deps, failed load).
+        Callers must catch this and return a structured error response.
+    """
+    if _model is None or _tokenizer is None:
+        raise RuntimeError("generation_model_unavailable")
+    device = next(_model.parameters()).device
+    inputs = _tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    output = model.generate(
+    output = _model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        pad_token_id=_tokenizer.pad_token_id or _tokenizer.eos_token_id,
     )
 
-    if is_encoder_decoder:
-        return tokenizer.decode(output[0], skip_special_tokens=True)
+    if _is_encoder_decoder:
+        return _tokenizer.decode(output[0], skip_special_tokens=True)
 
-    return tokenizer.decode(
+    return _tokenizer.decode(
         output[0][inputs["input_ids"].shape[1]:],
         skip_special_tokens=True,
     )
@@ -207,16 +226,19 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
         vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-        sessions[session_id] = {
-            "vectorstores": [vectorstore],
-            "filename": file.filename,
-            "last_accessed": time.time()
-        }
+        # Strict per-session isolation: each upload owns its own vectorstore.
+        # Write is protected by the lock so concurrent uploads never race.
+        with _session_lock:
+            sessions[session_id] = {
+                "vectorstores": [vectorstore],
+                "filename": file.filename,
+                "last_accessed": time.time(),
+            }
 
         return {
             "message": "PDF uploaded and processed",
             "session_id": session_id,
-            "page_count": len(docs)
+            "page_count": len(docs),
         }
 
     except Exception as e:
@@ -247,26 +269,30 @@ def ask_question(request: Request, data: AskRequest):
     if not data.session_ids:
         return {"answer": "No session selected.", "citations": []}
 
-    # Update last_accessed for all sessions
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            session["last_accessed"] = time.time()
+    # Snapshot relevant sessions under the lock, then do I/O outside it.
+    with _session_lock:
+        for sid in data.session_ids:
+            s = sessions.get(sid)
+            if s:
+                s["last_accessed"] = time.time()
+        _snap = {
+            sid: sessions[sid]
+            for sid in data.session_ids
+            if sid in sessions
+        }
 
     # Gather retrieved docs with their session filenames
     docs_with_meta = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vs = session["vectorstores"][0]
-            filename = session.get("filename", "unknown")
-            retrieved = vs.similarity_search(data.question, k=4)
-            for doc in retrieved:
-                docs_with_meta.append({
-                    "doc": doc,
-                    "filename": filename,
-                    "sid": sid
-                })
+    for sid, session in _snap.items():
+        vs = session["vectorstores"][0]
+        filename = session.get("filename", "unknown")
+        retrieved = vs.similarity_search(data.question, k=4)
+        for doc in retrieved:
+            docs_with_meta.append({
+                "doc": doc,
+                "filename": filename,
+                "sid": sid
+            })
 
     if not docs_with_meta:
         return {"answer": "No relevant context found.", "citations": []}
@@ -283,7 +309,10 @@ def ask_question(request: Request, data: AskRequest):
 
     # Use minimal prompt builder to reduce instruction echoing (upstream fix)
     prompt = build_ask_prompt(context=context, question=data.question)
-    raw_answer = generate_response(prompt, max_new_tokens=150)
+    try:
+        raw_answer = generate_response(prompt, max_new_tokens=150)
+    except RuntimeError:
+        return {"answer": None, "error": "generation_model_unavailable"}
     # Strip any leaked prompt/context text from the raw output
     clean_answer = extract_final_answer(raw_answer)
 
@@ -298,7 +327,7 @@ def ask_question(request: Request, data: AskRequest):
             seen.add(key)
             citations.append({
                 "page": page_num,
-                "source": item["filename"]
+                "source": item["filename"],
             })
 
     citations.sort(key=lambda c: (c["source"], c["page"]))
@@ -317,11 +346,16 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     if not data.session_ids:
         return {"summary": "No session selected."}
 
+    with _session_lock:
+        _snap = {
+            sid: sessions[sid]
+            for sid in data.session_ids
+            if sid in sessions
+        }
+
     vectorstores = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vectorstores.extend(session["vectorstores"])
+    for session in _snap.values():
+        vectorstores.extend(session["vectorstores"])
 
     if not vectorstores:
         return {"summary": "No documents found."}
@@ -335,7 +369,10 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     # ── Build minimal summarization prompt ───────────────────────────────────
     prompt = build_summarize_prompt(context=context)
 
-    raw_summary = generate_response(prompt, max_new_tokens=300)
+    try:
+        raw_summary = generate_response(prompt, max_new_tokens=300)
+    except RuntimeError:
+        return {"summary": None, "error": "generation_model_unavailable"}
     # Post-process: strip any leaked prompt/context text from the summary.
     summary = extract_final_summary(raw_summary)
     return {"summary": summary}
@@ -352,19 +389,25 @@ def compare_documents(request: Request, data: CompareRequest):
     if len(data.session_ids) < 2:
         return {"comparison": "Select at least 2 documents."}
 
+    with _session_lock:
+        _snap = {
+            sid: sessions[sid]
+            for sid in data.session_ids
+            if sid in sessions
+        }
+
     contexts = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vs = session["vectorstores"][0]
-            chunks = vs.similarity_search("main topics", k=4)
-            text = "\n".join([c.page_content for c in chunks])
-            contexts.append(text)
+    for session in _snap.values():
+        vs = session["vectorstores"][0]
+        chunks = vs.similarity_search("main topics", k=4)
+        text = "\n".join([c.page_content for c in chunks])
+        contexts.append(text)
 
     # Retrieve top chunks from each document separately for fair comparison
     query = "summarize the main topic, purpose, and key details of this document"
     per_doc_contexts = []
-    for i, vs in enumerate(vectorstores):
+    for session in _snap.values():
+        vs = session["vectorstores"][0]
         chunks = vs.similarity_search(query, k=4)
         text = "\n".join([c.page_content for c in chunks])
         per_doc_contexts.append(text)
@@ -372,7 +415,10 @@ def compare_documents(request: Request, data: CompareRequest):
     # ── Build minimal comparison prompt ───────────────────────────────────────
     prompt = build_compare_prompt(per_doc_contexts=per_doc_contexts)
 
-    raw = generate_response(prompt, max_new_tokens=400)
+    try:
+        raw = generate_response(prompt, max_new_tokens=400)
+    except RuntimeError:
+        return {"comparison": None, "error": "generation_model_unavailable"}
     # Post-process: strip any leaked prompt/context text from the comparison.
     comparison = extract_comparison(raw)
     return {"comparison": comparison}
